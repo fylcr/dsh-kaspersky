@@ -30,7 +30,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve, sep } from 'node:path'
 
 import { findAvp, readTotalDetected, writeThreatReport } from './lib/kaspersky.js'
-import { DEFAULT_IGNORE, diff, scan } from './lib/ledger.js'
+import { DEFAULT_IGNORE, diff, isReadableDir, scan } from './lib/ledger.js'
 import { buildAlert, buildPromptSection } from './lib/messages.js'
 
 /** Required services; the plugin stays inactive in a profile without them. */
@@ -177,10 +177,19 @@ export function apply(ctx, config) {
 		for (const root of roots) {
 			const current = await scan(root, { ignore: options.ignore, maxFiles: options.maxFiles })
 			const previous = ledgers.get(root)
+			// An unreadable root walks as empty, and diffing that would report the
+			// whole workspace as deleted. Forget the baseline instead, so the next
+			// readable poll re-establishes it.
+			if (current.size === 0 && !(await isReadableDir(root))) {
+				ledgers.delete(root)
+				continue
+			}
 			ledgers.set(root, current)
 			if (previous === undefined) continue // first poll only establishes the ledger
 			vanished.push(...diff(previous, current, { maxAgeMs: options.artifactMaxAgeMs }))
 		}
+		// Sessions end; their ledgers must not outlive them.
+		for (const root of ledgers.keys()) if (!roots.includes(root)) ledgers.delete(root)
 		if (vanished.length === 0) {
 			// Refresh the baseline occasionally so a later rise stays attributable,
 			// without paying for an avp.com process on every single poll.

@@ -12,7 +12,7 @@ import { join } from 'node:path'
 
 import { apply } from '../index.js'
 import { findAvp, parseTotalDetected, readTotalDetected } from '../lib/kaspersky.js'
-import { diff, scan } from '../lib/ledger.js'
+import { diff, isReadableDir, scan } from '../lib/ledger.js'
 import { buildAlert, buildPromptSection } from '../lib/messages.js'
 
 let passed = 0
@@ -76,6 +76,12 @@ await withTempDir(async (dir) => {
 
 		check('never reports new files as vanished', diff(after, await scan(dir), { maxAgeMs: 60_000 }).length === 0)
 		check('a missing root scans as empty rather than throwing', (await scan(join(dir, 'nope'))).size === 0)
+
+		// "Empty" and "unreadable" walk identically, and only one of them means the
+		// workspace is gone — this is what stops a vanished root from being reported
+		// as a workspace-wide deletion.
+		check('a live directory reads as readable', await isReadableDir(dir))
+		check('a vanished directory does not', !(await isReadableDir(join(dir, 'nope'))))
 })
 
 console.log('messages')
@@ -147,7 +153,6 @@ await withTempDir(async (dir) => {
 		rmSync(join(dir, name)) // what Kaspersky does to it
 		await new Promise((resolve) => setTimeout(resolve, 1800)) // next poll notices
 	}
-	dispose()
 
 	const alerts = delivered.filter((message) => message?.content)
 	check('pushes a followup into the agent', alerts.length > 0)
@@ -157,6 +162,15 @@ await withTempDir(async (dir) => {
 	check('the followup carries the plugin as its source', alerts[0]?.source?.plugin === 'dsh-kaspersky')
 	check('the alert names the deleted artifact', alerts[0]?.content?.[0]?.text?.includes('artifact.exe'))
 	check('no poll or dispatch error was logged', !delivered.some((message) => message.warning))
+
+	// The workspace itself going away must not read as "everything was deleted".
+	writeFileSync(join(dir, 'artifact3.exe'), 'freshly built')
+	await new Promise((resolve) => setTimeout(resolve, 600)) // ledger remembers it
+	const before = delivered.length
+	rmSync(dir, { recursive: true, force: true }) // the whole root, not just the file
+	await new Promise((resolve) => setTimeout(resolve, 800))
+	dispose()
+	check('a vanished workspace root raises no alert', delivered.length === before, `${delivered.length - before} extra`)
 })
 
 console.log('live avp.com')

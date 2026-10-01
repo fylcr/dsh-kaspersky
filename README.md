@@ -33,12 +33,16 @@ workspace walk (15 s)                →  build.exe disappeared  ─┘
 * **The deletion** comes from a ledger: the plugin walks every live session's
   working directory each poll and diffs it against the previous walk. A file
   that was there and is now gone — and was written within the last
-  `artifactMaxAgeMs` — is a vanished artifact.
+  `artifactMaxAgeMs` — is a vanished artifact. A root that cannot be listed is
+  forgotten rather than diffed, so an unreadable workspace never reads as a
+  deleted one.
 * **The message** is delivered with `agent.followup(...)`, which wakes the agent.
-  The plugin only pushes to agents whose working directory contained the
-  vanished file. It is built in the shape `createUserMessage()` produces —
-  `{ id, role, content, source }` — with a fresh id per alert, because the inbox
-  rejects a splice that would leave two pending messages sharing an id.
+  It goes to the agents whose working directory contained the vanished file, and
+  falls back to the top-level agents when none does — a hand-configured `paths`
+  entry can vanish without any session owning it. It is built in the shape
+  `createUserMessage()` produces — `{ id, role, content, source }` — with a
+  fresh id per alert, because the inbox rejects a splice that would leave two
+  pending messages sharing an id.
 * **Detections that cannot be localised** are logged, not delivered. If the
   counter rises across a baseline refresh while no watched file disappeared, the
   plugin writes one line to the harness log. The detection may have been blocked
