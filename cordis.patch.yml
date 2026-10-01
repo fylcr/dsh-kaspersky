@@ -1,0 +1,9 @@
+# dsh-kaspersky — bundle patch.
+#
+# One host-only plugin row. Everything tunable lives in `config` below: a
+# profile-level override of this row replaces the whole `config` object, so
+# copy the keys you want to keep.
+- insert:
+    - id: kaspersky-guard
+      name: dsh-kaspersky
+      config: {}

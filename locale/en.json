@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Kaspersky Guard",
+    "description": "Watches Kaspersky and pushes an alert into the agent when the antivirus deletes a file the agent just wrote."
+  }
+}

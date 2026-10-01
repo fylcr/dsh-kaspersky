@@ -1,0 +1,39 @@
+{
+  "name": "dsh-kaspersky",
+  "version": "0.1.0",
+  "description": "Watch Kaspersky and tell the agent when it deletes an artifact the agent just produced.",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "lib",
+    "locale",
+    "cordis.patch.yml",
+    "README.md",
+    "README.zh.md"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "kaspersky",
+    "antivirus"
+  ],
+  "engines": {
+    "dsh": ">=0.2.0-rc.2"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "meta": {
+    "title": "Kaspersky Guard",
+    "description": "Pushes an antivirus alert into the agent when Kaspersky deletes a file the agent just wrote."
+  },
+  "scripts": {
+    "test": "node test/run.mjs"
+  }
+}
