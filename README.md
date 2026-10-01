@@ -36,7 +36,14 @@ workspace walk (15 s)                →  build.exe disappeared  ─┘
   `artifactMaxAgeMs` — is a vanished artifact.
 * **The message** is delivered with `agent.followup(...)`, which wakes the agent.
   The plugin only pushes to agents whose working directory contained the
-  vanished file.
+  vanished file. It is built in the shape `createUserMessage()` produces —
+  `{ id, role, content, source }` — with a fresh id per alert, because the inbox
+  rejects a splice that would leave two pending messages sharing an id.
+* **Detections that cannot be localised** are logged, not delivered. If the
+  counter rises across a baseline refresh while no watched file disappeared, the
+  plugin writes one line to the harness log. The detection may have been blocked
+  rather than deleted, or may not have been in a workspace at all; waking an
+  agent for that would be noise.
 
 ### The honesty rule
 
@@ -98,9 +105,9 @@ $ npm test
 
 The suite checks the counter parser against verbatim `avp.com` output, the
 ledger against a real temporary tree, the message text against both counter
-outcomes, and `apply()` against a stand-in Cordis context — including that a
-deleted artifact actually reaches `agent.followup`. The final group is a live
-probe and is skipped when `avp.com` is not installed.
+outcomes, and `apply()` against a stand-in Cordis context — including that two
+deleted artifacts are delivered as two distinct, well-formed messages. The
+final group is a live probe and is skipped when `avp.com` is not installed.
 
 Measured on Kaspersky 21.26 (KAVKISKTS, zh-CN) on Windows: `avp.com STATUS` and
 `avp.com STATISTICS` work with no login; `avp.com REPORT` and `avp.com TRACES`

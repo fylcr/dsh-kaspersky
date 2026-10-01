@@ -20,7 +20,8 @@ avp.com STATISTICS File_Monitoring   →  "Total detected: 21"   ─┐
 
 * **计数**来自 `avp.com STATISTICS <profile>`：不需要登录，单调递增，两次轮询之间上升即代表杀软刚刚检出并处理了东西。
 * **删除**来自账本：插件每次轮询遍历每个活动会话的工作目录，与上一次遍历做差。之前存在、现在没了、且写入时间在 `artifactMaxAgeMs` 之内的文件，就是被删掉的产物。
-* **消息**通过 `agent.followup(...)` 投递（会唤醒 agent），且只推给工作目录覆盖了被删文件的 agent。
+* **消息**通过 `agent.followup(...)` 投递（会唤醒 agent），且只推给工作目录覆盖了被删文件的 agent。消息的字段与 `createUserMessage()` 产出的形状一致（`{ id, role, content, source }`），每条告警一个新 id——收件箱会拒绝让两条待处理消息共用同一个 id。
+* **定位不到的检出只记日志**：如果计数在基线刷新时上升、但工作区没有任何文件消失，插件只往 harness 日志写一行。那次检出可能是被拦截而非删除，也可能根本不在工作区里；为它唤醒 agent 只是噪音。
 
 ### 诚实规则
 
@@ -71,7 +72,7 @@ avp.com STATISTICS File_Monitoring   →  "Total detected: 21"   ─┐
 $ npm test
 ```
 
-测试覆盖：用实测的 `avp.com` 输出原文校验计数解析；用真实临时目录校验账本；两种计数结果下的消息文本；以及用替身 Cordis 上下文驱动 `apply()`——其中包括「被删产物确实送达 `agent.followup`」。最后一组是实机探针，未安装 `avp.com` 时自动跳过。
+测试覆盖：用实测的 `avp.com` 输出原文校验计数解析；用真实临时目录校验账本；两种计数结果下的消息文本；以及用替身 Cordis 上下文驱动 `apply()`——其中包括「连删两个产物会送达两条 id 不同、字段完整的消息」。最后一组是实机探针，未安装 `avp.com` 时自动跳过。
 
 在 Windows 上的卡巴斯基 21.26（KAVKISKTS，中文版）实测：`avp.com STATUS` 与 `avp.com STATISTICS` 无需登录；`avp.com REPORT` 与 `avp.com TRACES` 会打印 `Login required:` 并要求凭据。该产品在 Windows 事件日志里没有卡巴斯基通道，`ProgramData\Kaspersky Lab\AVP*\Report\Database\reports.db` 又被自我保护挡住——这就是为什么用计数作为信号。
 

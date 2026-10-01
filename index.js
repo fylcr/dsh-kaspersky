@@ -25,6 +25,7 @@
  * @module dsh-kaspersky
  */
 
+import { randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join, resolve, sep } from 'node:path'
 
@@ -70,6 +71,24 @@ function contains(parent, child) {
 	if (parent === child) return true
 	const withSep = parent.endsWith(sep) ? parent : parent + sep
 	return child.startsWith(withSep)
+}
+
+/**
+ * One inbox message, in the shape `createUserMessage()` from
+ * `@deepseek-ai/dsh-llm` builds: `{ id, role, content, source }`, frozen.
+ *
+ * The id is not decoration. The agent inbox rejects a splice that would leave
+ * two pending messages sharing an id, and a message without one collides with
+ * itself — so a second alert while the first is still queued would be thrown
+ * away. Rebuilt here rather than imported to keep the bundle dependency-free.
+ */
+function buildMessage(text) {
+	return Object.freeze({
+		id: randomUUID(),
+		role: 'user',
+		content: Object.freeze([Object.freeze({ type: 'text', text })]),
+		source: Object.freeze({ kind: 'plugin', plugin: 'dsh-kaspersky' }),
+	})
 }
 
 export function apply(ctx, config) {
@@ -162,8 +181,17 @@ export function apply(ctx, config) {
 			// Refresh the baseline occasionally so a later rise stays attributable,
 			// without paying for an avp.com process on every single poll.
 			if (Date.now() - lastTotalAt > options.counterRefreshMs) {
+				const before = lastTotal
 				const read = await readCounter()
 				if (typeof read.total === 'number') lastTotal = read.total
+				// A detection the workspace never felt. Worth saying out loud in the
+				// harness log, never worth waking an agent for.
+				if (before !== null && typeof read.total === 'number' && read.total > before) {
+					ctx.logger.warn(
+						`dsh-kaspersky: ${options.statisticsProfile} detected ${read.total - before} more object(s)`
+							+ ` (counter ${before} → ${read.total}) but no watched file disappeared`,
+					)
+				}
 			}
 			return
 		}
@@ -194,10 +222,7 @@ export function apply(ctx, config) {
 		const text = buildAlert({ vanished, roots, counter, threat })
 		for (const agent of pickTargets(vanished, roots)) {
 			try {
-				agent.followup({
-					content: [{ type: 'text', text }],
-					source: { kind: 'plugin', plugin: 'dsh-kaspersky' },
-				})
+				agent.followup(buildMessage(text))
 			} catch (error) {
 				ctx.logger.warn(`dsh-kaspersky: could not reach agent "${agent?.id}": ${String(error)}`)
 			}

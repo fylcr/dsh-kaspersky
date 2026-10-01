@@ -109,10 +109,22 @@ console.log('plugin wiring')
 // only shows up here, not in the pure helpers.
 await withTempDir(async (dir) => {
 	const delivered = []
+	const malformed = []
+	// The real inbox rejects a splice that leaves two pending messages sharing
+	// an id, so the stand-in does too: it never drains, which is the worst case.
+	const pending = new Set()
 	const agent = {
 		id: 'test-agent',
 		session: { header: { cwd: dir } },
-		followup: (message) => delivered.push(message),
+		followup: (message) => {
+			if (typeof message?.id !== 'string' || message.id.length === 0) malformed.push('missing id')
+			else if (pending.has(message.id)) malformed.push(`duplicate id ${message.id}`)
+			else pending.add(message.id)
+			if (message?.role !== 'user') malformed.push('role is not user')
+			if (message?.content?.[0]?.type !== 'text') malformed.push('content is not a text block')
+			if (message?.source?.plugin !== 'dsh-kaspersky') malformed.push('wrong source')
+			delivered.push(message)
+		},
 	}
 	const sections = []
 	const ctx = {
@@ -122,21 +134,28 @@ await withTempDir(async (dir) => {
 		effect: (body) => body(),
 	}
 
-	const dispose = apply(ctx, { paths: [dir], pollMs: 100, timeoutMs: 15_000 })
+	const dispose = apply(ctx, { paths: [dir], pollMs: 100, timeoutMs: 15_000, minAlertIntervalMs: 1000 })
 	check('registers exactly one prompt section', sections.length === 1)
 	check('the section carries a finite order', Number.isFinite(sections[0]?.order))
 	check('the section is named dsh-kaspersky:guard', sections[0]?.name === 'dsh-kaspersky:guard')
 
-	writeFileSync(join(dir, 'artifact.exe'), 'freshly built')
-	await new Promise((resolve) => setTimeout(resolve, 400)) // ledger remembers it
-	rmSync(join(dir, 'artifact.exe')) // what Kaspersky does to it
-	await new Promise((resolve) => setTimeout(resolve, 800)) // next poll notices
+	// Two full write → delete cycles, so the second alert lands while the first
+	// message is still queued — exactly what a fixed message id would break.
+	for (const name of ['artifact.exe', 'artifact2.exe']) {
+		writeFileSync(join(dir, name), 'freshly built')
+		await new Promise((resolve) => setTimeout(resolve, 600)) // ledger remembers it
+		rmSync(join(dir, name)) // what Kaspersky does to it
+		await new Promise((resolve) => setTimeout(resolve, 1800)) // next poll notices
+	}
 	dispose()
 
-	const alert = delivered.find((message) => message?.content)
-	check('pushes a followup into the agent', alert !== undefined)
-	check('the followup carries the plugin as its source', alert?.source?.plugin === 'dsh-kaspersky')
-	check('the alert names the deleted artifact', alert?.content?.[0]?.text?.includes('artifact.exe'))
+	const alerts = delivered.filter((message) => message?.content)
+	check('pushes a followup into the agent', alerts.length > 0)
+	check('delivers an alert for each deleted artifact', alerts.length === 2, `got ${alerts.length}`)
+	check('the alerts carry distinct message ids', new Set(alerts.map((m) => m.id)).size === alerts.length)
+	check('the followup is a well-formed user message', malformed.length === 0, malformed.join('; '))
+	check('the followup carries the plugin as its source', alerts[0]?.source?.plugin === 'dsh-kaspersky')
+	check('the alert names the deleted artifact', alerts[0]?.content?.[0]?.text?.includes('artifact.exe'))
 	check('no poll or dispatch error was logged', !delivered.some((message) => message.warning))
 })
 
