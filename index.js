@@ -10,17 +10,21 @@
  *
  * 1. **Watches Kaspersky.** It polls `avp.com STATISTICS <profile>` for the
  *    `Total detected:` counter — the only signal the product exposes without a
- *    password.
+ *    password. The counter is read every poll, because a file can be written
+ *    and eaten well inside one poll window, and then the ledger below never
+ *    sees it at all.
  * 2. **Watches the workspace.** It keeps a ledger of files under every live
  *    session's working directory and detects files that disappear.
- * 3. **Tells the agent.** When a recently written file vanishes, it pushes one
- *    message into the agents that own that directory: which files are gone,
- *    what the counter did, and the warning that the code just generated may
- *    contain malicious content.
+ * 3. **Tells the agent.** When a recently written file vanishes — or when the
+ *    counter rises without one doing so — it pushes one message into the
+ *    agents that own that directory: which files are gone, what the counter
+ *    did, and the warning that the code just generated may contain malicious
+ *    content.
  *
- * When files vanish but the counter did not rise, the message says the cause
- * was not measured. The plugin never asserts Kaspersky deleted something it
- * did not see Kaspersky detect.
+ * The message names Kaspersky as the cause only as far as it measured it: the
+ * counter is machine-wide, so a rise is reported as a detection that coincided
+ * with the disappearance, never as proof that these files were what it deleted.
+ * When the counter did not rise, the message says the cause was not measured.
  *
  * @module dsh-kaspersky
  */
@@ -42,12 +46,10 @@ const DEFAULTS = {
 	avp: '',
 	/** Which protection component's counter to read. */
 	statisticsProfile: 'File_Monitoring',
-	/** How often to walk the workspaces, in milliseconds. */
+	/** How often to walk the workspaces and read the counter, in milliseconds. */
 	pollMs: 15_000,
 	/** Bound on a single avp.com call, in milliseconds. */
 	timeoutMs: 20_000,
-	/** How often the counter baseline is refreshed while nothing disappears. */
-	counterRefreshMs: 300_000,
 	/** Extra directories to watch, absolute or relative to the host's cwd. */
 	paths: [],
 	/** Directory names the ledger walk never descends into. */
@@ -58,7 +60,7 @@ const DEFAULTS = {
 	artifactMaxAgeMs: 2 * 60 * 60 * 1000,
 	/** Minimum gap between two pushed alerts, in milliseconds. */
 	minAlertIntervalMs: 30_000,
-	/** avp.com credentials; without them threat names stay unavailable. */
+	/** avp.com credentials, for threat names. Passed on the command line. */
 	login: '',
 	password: '',
 }
@@ -66,7 +68,10 @@ const DEFAULTS = {
 /** Section order 3200: after the tool sections, before the SDK ones. */
 const SECTION_ORDER = 3200
 
-/** Whether `child` is `parent` itself or sits underneath it. */
+/** Windows compares paths case-insensitively, so the plugin must too. */
+const foldCase = (path) => (process.platform === 'win32' ? path.toLowerCase() : path)
+
+/** Whether `child` is `parent` itself or sits underneath it. Both folded. */
 function contains(parent, child) {
 	if (parent === child) return true
 	const withSep = parent.endsWith(sep) ? parent : parent + sep
@@ -91,25 +96,48 @@ function buildMessage(text) {
 	})
 }
 
+/** A config value that should be an array of strings, from YAML or defaults. */
+function stringList(value, fallback) {
+	if (Array.isArray(value)) return value.filter((item) => typeof item === 'string' && item.length > 0)
+	if (typeof value === 'string' && value.length > 0) return [value] // `paths: D:\work`
+	return fallback
+}
+
+/** A config value that should be a number, clamped so a typo cannot spin a poll. */
+function number(value, fallback, min) {
+	const parsed = Number(value)
+	return Number.isFinite(parsed) ? Math.max(min, parsed) : fallback
+}
+
 export function apply(ctx, config) {
 	const options = { ...DEFAULTS, ...(config ?? {}) }
-	const paths = options.paths.map((path) => resolve(path))
+	const paths = stringList(options.paths, []).map((path) => resolve(path))
+	const ignore = stringList(options.ignore, DEFAULT_IGNORE)
+	const pollMs = number(options.pollMs, DEFAULTS.pollMs, 1000)
+	const maxFiles = number(options.maxFiles, DEFAULTS.maxFiles, 1)
+	const minAlertIntervalMs = number(options.minAlertIntervalMs, DEFAULTS.minAlertIntervalMs, 0)
 	// `logger` is a core context property rather than an injected service, but
 	// the shipped user plugins still guard it: a missing logger must not be
 	// what stops the watcher from loading.
 	const logger = ctx.logger ?? console
 
-	/** root → (path → { size, mtimeMs }) from the previous poll. */
+	/** folded root → (path → { size, mtimeMs }) from the previous poll. */
 	const ledgers = new Map()
+	/** Vanished files held back by the alert rate limit, reported next time. */
+	let pending = []
 	/** Last counter value seen, or null before the first successful read. */
 	let lastTotal = null
-	let lastTotalAt = 0
 	let lastAlertAt = 0
+	/** Roots already reported as unreadable, so the warning is said once. */
+	const complained = new Set()
+	/** A poll that is still running must not be joined by the next one. */
+	let running = false
+	let disposed = false
 	/** Resolved once; re-resolved while null so an install after boot is picked up. */
 	let avp = findAvp(options.avp)
 
 	logger.info(
-		`dsh-kaspersky: watching every session workspace every ${Math.round(options.pollMs / 1000)}s`
+		`dsh-kaspersky: watching every session workspace every ${Math.round(pollMs / 1000)}s`
 			+ (avp ? `, avp.com at ${avp}` : ', avp.com not found yet'),
 	)
 
@@ -117,7 +145,7 @@ export function apply(ctx, config) {
 		name: 'dsh-kaspersky:guard',
 		order: SECTION_ORDER,
 		text: buildPromptSection({
-			pollMs: options.pollMs,
+			pollMs,
 			profile: options.statisticsProfile,
 			paths,
 		}),
@@ -125,21 +153,25 @@ export function apply(ctx, config) {
 
 	/** Working directories of every live agent, plus the configured extras. */
 	function watchRoots() {
-		const roots = new Set(paths)
+		const roots = new Map()
+		for (const path of paths) roots.set(foldCase(path), path)
 		for (const agent of ctx.agents.list()) {
 			try {
 				const cwd = agent?.session?.header?.cwd
-				if (typeof cwd === 'string' && cwd.length > 0) roots.add(resolve(cwd))
+				if (typeof cwd !== 'string' || cwd.length === 0) continue
+				const resolved = resolve(cwd)
+				const key = foldCase(resolved)
+				if (!roots.has(key)) roots.set(key, resolved)
 			} catch {
 				// A disposing agent is not this poll's problem.
 			}
 		}
-		return [...roots]
+		return roots
 	}
 
 	/** The agents whose working directory contains one of the vanished files. */
 	function pickTargets(vanished, roots) {
-		const touched = new Set(vanished.map((file) => file.path))
+		const touched = vanished.map((file) => foldCase(file.path))
 		const owners = []
 		for (const agent of ctx.agents.list()) {
 			let cwd
@@ -149,76 +181,89 @@ export function apply(ctx, config) {
 				continue
 			}
 			if (typeof cwd !== 'string' || cwd.length === 0) continue
-			const root = resolve(cwd)
-			if (!roots.includes(root)) continue
-			for (const path of touched) {
-				if (contains(root, path)) {
-					owners.push(agent)
-					break
-				}
-			}
+			const key = foldCase(resolve(cwd))
+			if (!roots.has(key)) continue
+			if (touched.some((path) => contains(key, path))) owners.push(agent)
 		}
-		return owners.length > 0 ? owners : ctx.agents.roots()
+		if (owners.length > 0) return owners
+		// A hand-configured path can vanish without any session owning it.
+		try {
+			return ctx.agents.roots()
+		} catch (error) {
+			logger.warn(`dsh-kaspersky: could not list root agents: ${String(error)}`)
+			return []
+		}
 	}
 
-	/** Read the counter, remembering what a failure looked like for the alert. */
+	/** Say a thing about one root once, however many polls it stays true. */
+	function complainOnce(key, message) {
+		if (complained.has(key)) return
+		complained.add(key)
+		logger.warn(`dsh-kaspersky: ${message}`)
+	}
+
+	/** Read the counter; never throws, and reports why when it fails. */
 	async function readCounter() {
 		avp ??= findAvp(options.avp)
-		const result = await readTotalDetected(avp, options.statisticsProfile, options.timeoutMs)
-		if (typeof result.total === 'number') lastTotalAt = Date.now()
-		return result
+		return readTotalDetected(avp, options.statisticsProfile, options.timeoutMs)
 	}
 
 	async function tick() {
-		const roots = watchRoots()
-		if (roots.length === 0) return // no live session yet; nothing to remember
+		if (disposed) return
 
-		const vanished = []
-		for (const root of roots) {
-			const current = await scan(root, { ignore: options.ignore, maxFiles: options.maxFiles })
-			const previous = ledgers.get(root)
+		const roots = watchRoots()
+		if (roots.size === 0) return // no live session yet; nothing to remember
+
+		const vanished = [...pending]
+		for (const [key, root] of roots) {
+			const current = await scan(root, { ignore, maxFiles })
+			const previous = ledgers.get(key)
 			// An unreadable root walks as empty, and diffing that would report the
 			// whole workspace as deleted. Forget the baseline instead, so the next
 			// readable poll re-establishes it.
 			if (current.size === 0 && !(await isReadableDir(root))) {
-				ledgers.delete(root)
+				ledgers.delete(key)
+				complainOnce(key, `watch root ${root} cannot be listed; its baseline was dropped`)
 				continue
 			}
-			ledgers.set(root, current)
+			ledgers.set(key, current)
 			if (previous === undefined) continue // first poll only establishes the ledger
+			// A walk that hit the file cap, or could not open a directory, is a
+			// partial view: which files fell outside it moves between polls, and
+			// diffing it would invent deletions that never happened.
+			if (current.truncated || current.unreadable || previous.truncated || previous.unreadable) {
+				complainOnce(
+					key,
+					`walk of ${root} was incomplete (${current.truncated || previous.truncated ? 'hit maxFiles' : 'unreadable directory'});`
+						+ ' no deletions were reported for it this poll',
+				)
+				continue
+			}
 			vanished.push(...diff(previous, current, { maxAgeMs: options.artifactMaxAgeMs }))
 		}
 		// Sessions end; their ledgers must not outlive them.
-		for (const root of ledgers.keys()) if (!roots.includes(root)) ledgers.delete(root)
-		if (vanished.length === 0) {
-			// Refresh the baseline occasionally so a later rise stays attributable,
-			// without paying for an avp.com process on every single poll.
-			if (Date.now() - lastTotalAt > options.counterRefreshMs) {
-				const before = lastTotal
-				const read = await readCounter()
-				if (typeof read.total === 'number') lastTotal = read.total
-				// A detection the workspace never felt. Worth saying out loud in the
-				// harness log, never worth waking an agent for.
-				if (before !== null && typeof read.total === 'number' && read.total > before) {
-					logger.warn(
-						`dsh-kaspersky: ${options.statisticsProfile} detected ${read.total - before} more object(s)`
-							+ ` (counter ${before} → ${read.total}) but no watched file disappeared`,
-					)
-				}
-			}
+		for (const key of ledgers.keys()) if (!roots.has(key)) ledgers.delete(key)
+
+		// Read the counter every poll: a file written and eaten inside one poll
+		// window never reaches the ledger, and the counter is all that is left.
+		const read = await readCounter()
+		const before = lastTotal
+		const after = typeof read.total === 'number' ? read.total : null
+		const rose = before !== null && after !== null && after > before
+		const counter = { before, after, profile: options.statisticsProfile, problem: read.problem }
+
+		if (vanished.length === 0 && !rose) {
+			pending = []
+			if (after !== null) lastTotal = after // quiet poll: keep the baseline current
 			return
 		}
 
-		const read = await readCounter()
-		const counter = {
-			before: lastTotal,
-			after: typeof read.total === 'number' ? read.total : null,
-			profile: options.statisticsProfile,
+		if (Date.now() - lastAlertAt < minAlertIntervalMs) {
+			// Held back, not dropped: the baseline is left where it was and the
+			// files are carried into the next alert, so the rise is still reported.
+			pending = vanished
+			return
 		}
-		if (typeof read.total === 'number') lastTotal = read.total
-
-		if (Date.now() - lastAlertAt < options.minAlertIntervalMs) return
-		lastAlertAt = Date.now()
 
 		let threat = { problem: read.problem ?? '未配置 avp.com 登录名/密码' }
 		if (options.login && options.password) {
@@ -232,7 +277,11 @@ export function apply(ctx, config) {
 			})
 		}
 
-		const text = buildAlert({ vanished, roots, counter, threat })
+		const text = buildAlert({ vanished, roots: [...roots.values()], counter, threat })
+		pending = []
+		if (after !== null) lastTotal = after
+		lastAlertAt = Date.now()
+
 		for (const agent of pickTargets(vanished, roots)) {
 			try {
 				agent.followup(buildMessage(text))
@@ -242,13 +291,24 @@ export function apply(ctx, config) {
 		}
 	}
 
-	/** Never let one bad poll kill the timer. */
-	const safely = () => {
-		tick().catch((error) => logger.warn(`dsh-kaspersky: poll failed: ${String(error)}`))
+	/** Never let one bad poll kill the timer, and never run two at once. */
+	const safely = async () => {
+		if (running || disposed) return
+		running = true
+		try {
+			await tick()
+		} catch (error) {
+			logger.warn(`dsh-kaspersky: poll failed: ${String(error)}`)
+		} finally {
+			running = false
+		}
 	}
-	safely()
-	const timer = setInterval(safely, options.pollMs)
+	void safely()
+	const timer = setInterval(() => void safely(), pollMs)
 	timer.unref?.()
 
-	return ctx.effect(() => () => clearInterval(timer))
+	return ctx.effect(() => () => {
+		disposed = true
+		clearInterval(timer)
+	})
 }
