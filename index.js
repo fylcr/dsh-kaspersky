@@ -94,6 +94,10 @@ function buildMessage(text) {
 export function apply(ctx, config) {
 	const options = { ...DEFAULTS, ...(config ?? {}) }
 	const paths = options.paths.map((path) => resolve(path))
+	// `logger` is a core context property rather than an injected service, but
+	// the shipped user plugins still guard it: a missing logger must not be
+	// what stops the watcher from loading.
+	const logger = ctx.logger ?? console
 
 	/** root → (path → { size, mtimeMs }) from the previous poll. */
 	const ledgers = new Map()
@@ -104,7 +108,7 @@ export function apply(ctx, config) {
 	/** Resolved once; re-resolved while null so an install after boot is picked up. */
 	let avp = findAvp(options.avp)
 
-	ctx.logger.info(
+	logger.info(
 		`dsh-kaspersky: watching every session workspace every ${Math.round(options.pollMs / 1000)}s`
 			+ (avp ? `, avp.com at ${avp}` : ', avp.com not found yet'),
 	)
@@ -187,7 +191,7 @@ export function apply(ctx, config) {
 				// A detection the workspace never felt. Worth saying out loud in the
 				// harness log, never worth waking an agent for.
 				if (before !== null && typeof read.total === 'number' && read.total > before) {
-					ctx.logger.warn(
+					logger.warn(
 						`dsh-kaspersky: ${options.statisticsProfile} detected ${read.total - before} more object(s)`
 							+ ` (counter ${before} → ${read.total}) but no watched file disappeared`,
 					)
@@ -224,14 +228,14 @@ export function apply(ctx, config) {
 			try {
 				agent.followup(buildMessage(text))
 			} catch (error) {
-				ctx.logger.warn(`dsh-kaspersky: could not reach agent "${agent?.id}": ${String(error)}`)
+				logger.warn(`dsh-kaspersky: could not reach agent "${agent?.id}": ${String(error)}`)
 			}
 		}
 	}
 
 	/** Never let one bad poll kill the timer. */
 	const safely = () => {
-		tick().catch((error) => ctx.logger.warn(`dsh-kaspersky: poll failed: ${String(error)}`))
+		tick().catch((error) => logger.warn(`dsh-kaspersky: poll failed: ${String(error)}`))
 	}
 	safely()
 	const timer = setInterval(safely, options.pollMs)
